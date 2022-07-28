@@ -1,0 +1,13 @@
+example*.py
+/data/
+/results/*
+/samples/
+
+*.ipynb
+.DS_Store
+core/__pycache__/
+__pycache__/
+results/**/
+*.pyc
+/heat_kernel/results/
+
