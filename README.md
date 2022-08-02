@@ -1,4 +1,5 @@
-# Heat-Explainer
+# HeatFlow
+## Interpreting Neural Networks Through the Lens ofHeat Flow
 
 ## Get Started
 
@@ -17,3 +18,13 @@
 
 
 ## Results
+
+### UTKFace
+Comparison of HeatFlow with vanilla Gradient(Grad), Smooth Gradient(SG), Integerated Gradients(IG) and Blur IG on facial age regression tasks.
+
+![alt text](https://github.com/XiaRui1996/heat-explainer/blob/master/exp/face/face.png?raw=true)
+
+### MNIST
+Heat diffusion for MNIST samples comparing logits of different class. **Left**: Change in function value. **Right**: HeatFlow attribution maps.
+
+![alt text](https://github.com/XiaRui1996/heat-explainer/blob/master/exp/mnist/mnist_compare.png?raw=true)
