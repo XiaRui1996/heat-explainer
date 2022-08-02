@@ -22,9 +22,9 @@
 ### UTKFace
 Comparison of HeatFlow with vanilla Gradient(Grad), Smooth Gradient(SG), Integerated Gradients(IG) and Blur IG on facial age regression tasks.
 
-![alt text](https://anonymous.4open.science/r/heat-explainer-0603/exp/face/face.png?raw=true)
+![alt text](exp/face/face.png?raw=true)
 
 ### MNIST
 Heat diffusion for MNIST samples comparing logits of different class. **Left**: Change in function value. **Right**: HeatFlow attribution maps.
 
-![alt text](https://anonymous.4open.science/r/heat-explainer-0603/exp/mnist/mnist_compare.png?raw=true)
+![alt text](exp/mnist/mnist_compare.png?raw=true)
