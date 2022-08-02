@@ -43,6 +43,11 @@ def sigmoid(x):
 def inverse_sigmoid_jax(x):
     return -jnp.log(jnp.maximum((1 / x) - 1, 1E-10))
 
+def inverse_sin_cos_jax(sin,cos):
+    c = jnp.arccos(cos)
+    s = jnp.arcsin(sin)
+    return jnp.where(s>0, c, 2*jnp.pi-c)
+
 class SyntheticDataset(Dataset):
     """Face Landmarks dataset."""
 
@@ -63,9 +68,20 @@ class SyntheticDataset(Dataset):
         
         if not os.path.isfile(fname+'/background.npy'):
             self.backgrounds = self.rng.uniform(size=(self.latent, length, length))
+            for j in range(self.latent):
+                self.backgrounds[j] = (self.backgrounds[j] + self.backgrounds[j].T)/2
             np.save(fname+'/background.npy', self.backgrounds)
         else:
             self.backgrounds = np.load(fname+'/background.npy')
+        
+        s = length // 2
+        diag = []
+        for i in range(latent):
+            v = np.square(self.backgrounds[i][0:s,s:s*2]).sum()/4.
+            diag.append(1./v)
+            s //= 2
+        self.metric = np.diag(diag/np.sqrt(np.square(diag).sum()))
+        print(self.metric)
         
         if generate:
             if not os.path.isfile(fname+'/'+folder+'_0_x.npy.gz'):
@@ -107,19 +123,20 @@ class SyntheticDataset(Dataset):
         return torch.from_numpy(pic.astype(np.float32)), output
 
     def generate(self):
-        z = self.rng.normal(scale=2.0, size=self.latent)
+        z = self.rng.uniform(0,2*np.pi,size=self.latent)
         y = self.label(z)
-        code = sigmoid(z)
+        sin_code = (1. +np.sin(z))/2.
+        cos_code = (1. +np.cos(z))/2.
 
         D, d = self.length, self.latent
         pic = np.zeros((D, D), dtype=self.dtype)
 
         s = D // 2
         for i in range(d):
-            pic[0:s,s:s*2] = code[i] * self.backgrounds[i][0:s,s:s*2]
-            pic[s:s*2,0:s] = (1-code[i]) * self.backgrounds[i][s:s*2,0:s]
+            pic[0:s,s:s*2] = sin_code[i] * self.backgrounds[i][0:s,s:s*2]
+            pic[s:s*2,0:s] = cos_code[i] * self.backgrounds[i][s:s*2,0:s]
             s //= 2
-        
+
         x = pic[:,:, np.newaxis]
 
         return z, x, y
@@ -128,26 +145,27 @@ class SyntheticDataset(Dataset):
         lower, upper = -self.yrange, self.yrange
         for x in z:
             mid = (lower + upper) / 2
-            if x <= 0.0:
+            if x <= np.pi:
                 lower = mid
             else:
                 upper = mid
 
         return self.rng.normal(
             loc=(lower + upper) / 2,
-            scale=np.abs(upper - lower) / 6 
+            scale=np.abs(upper - lower) / 6
         )
 
     def _decode_jax(self, z):
-        code = nn.sigmoid(z)
+        sin_code = (1. +jnp.sin(z))/2.
+        cos_code = (1. +jnp.cos(z))/2.
 
         D, d = self.length, self.latent
         pic = jnp.zeros((D, D), dtype=self.dtype)
 
         s = D // 2
         for i in range(d):
-            pic = pic.at[0:s,s:s*2].set(code[i] * self.backgrounds[i][0:s,s:s*2])
-            pic = pic.at[s:s*2,0:s].set((1-code[i]) * self.backgrounds[i][s:s*2,0:s])
+            pic = pic.at[0:s,s:s*2].set(sin_code[i] * self.backgrounds[i][0:s,s:s*2])
+            pic = pic.at[s:s*2,0:s].set(cos_code[i] * self.backgrounds[i][s:s*2,0:s])
             s //= 2
         return pic[:,:, jnp.newaxis]
 
@@ -160,19 +178,25 @@ class SyntheticDataset(Dataset):
 
     def encode_jax(self, x):
         x = jnp.squeeze(x, axis=-1)
-        code = []
+        sin_code, cos_code = [],[]
 
         s = self.length // 2
         for i in range(self.latent):
-            v = jnp.divide(
+            sin_v = jnp.divide(
                 jnp.sum(x[..., 0:s, s:s*2],axis=(-1,-2)),
                 jnp.sum(self.backgrounds[i][0:s, s:s*2])
-            )
-            code.append(v)
+            )*2. - 1.
+            cos_v = jnp.divide(
+                jnp.sum(x[..., s:s*2, 0:s],axis=(-1,-2)),
+                jnp.sum(self.backgrounds[i][s:s*2, 0:s])
+            )*2. - 1.
+            sin_code.append(sin_v)
+            cos_code.append(cos_v)
             s //= 2
 
-        code = jnp.stack(code, axis=-1)
-        z = inverse_sigmoid_jax(code)
+        sin_code = jnp.stack(sin_code, axis=-1)
+        cos_code = jnp.stack(cos_code, axis=-1)
+        z = inverse_sin_cos_jax(sin_code, cos_code)
         return z
 
 
@@ -196,9 +220,31 @@ class SyntheticYFDataset(Dataset):
         
         if not os.path.isfile(fname+'/background.npy'):
             self.backgrounds = self.rng.uniform(size=(self.latent, length, length))
+            for j in range(self.latent):
+                self.backgrounds[j] = (self.backgrounds[j] + self.backgrounds[j].T)/2
             np.save(fname+'/background.npy', self.backgrounds)
         else:
             self.backgrounds = np.load(fname+'/background.npy')
+
+        grid = self.length * np.linspace(0, 1, 2 * self.latent)
+        grid = grid.astype(int)
+
+        diag = []
+        for j in range(latent):
+            i = self.latent-1-j
+            x0, y0 = grid[i], grid[i]
+            x1, y1 = grid[-(i+1)], grid[-(i+1)]
+
+            tmp = self.backgrounds[i].copy()
+            if i < self.latent-1:
+                xx0,yy0 = grid[i+1], grid[i+1]
+                xx1,yy1 = grid[-(i+2)], grid[-(i+2)]
+                tmp[xx0:xx1,yy0:yy1] = 0.
+            v = np.square(tmp[x0:x1,y0:y1]).sum()/2.
+            diag.insert(0, 1./v)
+        self.metric = np.diag(diag/np.sqrt(np.square(diag).sum()))
+        print(self.metric)
+        
         
         if generate:
             if not os.path.isfile(fname+'/'+folder+'_0_x.npy.gz'):
@@ -240,21 +286,26 @@ class SyntheticYFDataset(Dataset):
         return torch.from_numpy(pic.astype(np.float32)), output
 
     def generate(self):
-        z = self.rng.normal(scale=2.0, size=self.latent)
+        z = self.rng.uniform(0,2*np.pi,size=self.latent)
         y = self.label(z)
-        code = sigmoid(z)
+        sin_code = (1.+np.sin(z))/2.
+        cos_code = (1.+np.cos(z))/2.
 
         D, d = self.length, self.latent
         pic = np.zeros((D, D), dtype=self.dtype)
         grid = D * np.linspace(0, 1, 2 * d)
         grid = grid.astype(int)
 
+
         for i in range(d):
             x0, y0 = grid[i], grid[i]
             x1, y1 = grid[-(i+1)], grid[-(i+1)]
+            tmp = self.backgrounds[i][x0:x1, y0:y1]
+            rows = np.tile(np.arange(x0,x1).reshape(-1,1),(1,x1-x0))
+            columns = np.tile(np.arange(y0,y1),(y1-y0,1))
+            tmp = np.where(rows>columns, sin_code[i]* tmp, cos_code[i] *tmp)
 
-            pic[x0:x1, y0:y1] = code[i] * self.backgrounds[i][x0:x1, y0:y1]
-        
+            pic[x0:x1, y0:y1] = tmp
         x = pic[:,:, np.newaxis]
 
         return z, x, y
@@ -263,28 +314,36 @@ class SyntheticYFDataset(Dataset):
         lower, upper = -self.yrange, self.yrange
         for x in z:
             mid = (lower + upper) / 2
-            if x <= 0.0:
+            if x <= np.pi:
                 lower = mid
             else:
                 upper = mid
 
         return self.rng.normal(
             loc=(lower + upper) / 2,
-            scale=np.abs(upper - lower) / 6 
+            scale=np.abs(upper - lower) / 6
         )
 
     def _decode_jax(self, z):
-        code = nn.sigmoid(z)
+        sin_code = (1. + jnp.sin(z))/2.
+        cos_code = (1. + jnp.cos(z))/2.
 
         D, d = self.length, self.latent
         pic = jnp.zeros((D, D), dtype=self.dtype)
         grid = D * np.linspace(0, 1, 2 * d)
         grid = grid.astype(int)
 
+
+
         for i in range(d):
             x0, y0 = grid[i], grid[i]
             x1, y1 = grid[-(i+1)], grid[-(i+1)]
-            pic = pic.at[x0:x1, y0:y1].set(code[i] * self.backgrounds[i][x0:x1, y0:y1])
+            tmp = self.backgrounds[i][x0:x1, y0:y1]
+            rows = jnp.tile(jnp.arange(x0,x1).reshape(-1,1),(1,x1-x0))
+            columns = jnp.tile(jnp.arange(y0,y1),(y1-y0,1))
+            tmp = jnp.where(rows>columns, sin_code[i]* tmp, cos_code[i] *tmp)
+
+            pic = pic.at[x0:x1, y0:y1].set(tmp)
 
         return pic[:,:, jnp.newaxis]
 
@@ -297,22 +356,33 @@ class SyntheticYFDataset(Dataset):
 
     def encode_jax(self, x):
         x = jnp.squeeze(x, axis=-1)
-        code = []
-        grid = D * np.linspace(0, 1, 2 * d)
+        sin_code, cos_code = [],[]
+        grid = self.length * np.linspace(0, 1, 2 * self.latent)
         grid = grid.astype(int)
 
         for i in range(self.latent):
             x0, y0 = grid[i], grid[i]
-            x1, y1 = grid[-(i+1)], grid[-(i+1)]
+            x1, y1 = grid[i+1], grid[i+1]
+            w0, w1 = grid[-(i+1)], grid[-(i+2)]
+            z0, z1 = grid[-(i+1)], grid[-(i+2)]
 
-            v = jnp.divide(
-                jnp.sum(x[..., x0:x1, y0:y1],axis=(-1,-2)),
-                jnp.sum(self.backgrounds[i][x0:x1, y0:y1])
-            )
-            code.append(v)
+            if i==self.latent-1:
+                w1, y1 = self.length//2, self.length//2
+                z1, x1 = self.length//2, self.length//2
+            sin_v = jnp.divide(
+                jnp.sum(x[..., z1:z0, y0:y1],axis=(-1,-2)),
+                jnp.sum(self.backgrounds[i][z1:z0, y0:y1])
+            ) * 2 - 1.0
+            cos_v = jnp.divide(
+                jnp.sum(x[..., x0:x1, w1:w0],axis=(-1,-2)),
+                jnp.sum(self.backgrounds[i][x0:x1, w1:w0])
+            ) * 2 - 1.0
+            sin_code.append(sin_v)
+            cos_code.append(cos_v)
 
-        code = jnp.stack(code, axis=-1)
-        z = inverse_sigmoid_jax(code)
+        sin_code = jnp.stack(sin_code, axis=-1)
+        cos_code = jnp.stack(cos_code, axis=-1)
+        z = inverse_sin_cos_jax(sin_code, cos_code)
         return z
                 
 

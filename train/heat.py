@@ -1,3 +1,4 @@
+from this import d
 import ml_collections as mlc
 from ml_collections import config_flags
 from flax.training.train_state import TrainState
@@ -16,54 +17,14 @@ import time
 
 from heat_explainer.train.predict import restore_checkpoints as predict_restore
 from heat_explainer.train.vae import restore_checkpoints as vae_restore
+from heat_explainer.train.immersion import Immersion
 from heat_explainer.trainutils.utils import save_image, warmup_cos_decay_lr_schedule_fn, to_heatmap
-from heat_explainer.models.base import l2_loss
+from heat_explainer.models.base import l2_loss, classification_loss
+from heat_explainer.models.regressor import CondImageRegressor
 from heat_explainer.datautils.dataloader import get_dataset
-from heat_explainer.saliency.method import vanilla_smooth_gradient, integrated_gradient_blur
-from heat_explainer.datautils.dataloader import SyntheticDataset
+from heat_explainer.datautils.dataloader import SyntheticDataset, SyntheticYFDataset
+from heat_explainer.train.decompose import laplacian_decompose
 
-
-
-class immersion(object):
-    def __init__(self, decoder):
-        self.decoder = decoder
-
-    @partial(jax.jit, static_argnums=(0,))
-    def metric_tensor(self, z):
-        N,d = z.shape
-        Jg = (vmap(jacfwd(self.decoder))(z)).reshape(N,-1,d)
-        M = vmap(jnp.dot)(jnp.transpose(Jg, (0,2,1)), Jg)
-        return M
-
-    @partial(jax.jit, static_argnums=(0,3), static_argnames=('num_steps',))
-    def random_walk(self, prng, z, scale=1.0, step_size=0.01, num_steps=10):
-        def body(carry, _):
-            z_, key = carry
-            key, subkey = random.split(key)
-            noise = random.normal(subkey, z_.shape)
-            M = self.metric_tensor(z_)*scale
-            L,U = vmap(jnp.linalg.eigh)(M)
-            coef = vmap(jnp.dot)(U, 1./jnp.sqrt(L) *noise)
-            zt = z_ + step_size * coef
-            carry = (zt, key)
-            return carry, zt
-        prefix, dim_z = z.shape[:-1], z.shape[-1]
-        z0 = jnp.reshape(z, (-1, dim_z))
-        _, zts = lax.scan(body, (z0, prng), jnp.arange(num_steps))
-        zts = jnp.reshape(zts, (num_steps, *prefix, dim_z))
-        return zts
-    
-    @partial(jax.jit, static_argnums=(0,))
-    def jac_hess(self, z):
-        d = z.shape[-1]
-        Jg = jnp.reshape(jacfwd(self.decoder)(z),(-1,d))
-        Hg = jnp.reshape(jacfwd(jacfwd(self.decoder))(z), (-1,d*d))
-        return Jg, Hg
-
-def classification_loss(output, label):
-    label = jax.nn.softmax(label)
-    output = jax.nn.log_softmax(output)
-    return -jnp.mean(jnp.sum(output * label, axis=-1))
 
 
 @jax.jit
@@ -83,8 +44,8 @@ def train_step(state, predictor, x_start, x_step):
 def solve_heat_kernel(config: mlc.ConfigDict, workdir: str):
     vaedir = Path(workdir) / 'vae'
     predictordir = Path(workdir) / 'predictor'
-    ckptdir = Path(workdir)  / 'heatkernel2'
-    imagedir = Path(workdir)  / 'heatkernel2' / 'images'
+    ckptdir = Path(workdir)  / 'heatkernel'
+    imagedir = Path(workdir)  / 'heatkernel' / 'images'
     ckptdir.mkdir(parents=True, exist_ok=True)
     imagedir.mkdir(parents=True, exist_ok=True)
 
@@ -103,7 +64,7 @@ def solve_heat_kernel(config: mlc.ConfigDict, workdir: str):
         vae = vae_restore(config, vaedir)
         @jax.jit
         def decoder(z): return vae.apply_fn({'params':vae.params}, z, key, mode='decode')
-    manifold = immersion(decoder)
+    manifold = Immersion(decoder)
 
     scale = -np.inf
     for j in range(0, n, b):
@@ -175,149 +136,60 @@ def solve_heat_kernel(config: mlc.ConfigDict, workdir: str):
         Z_prev = Z_step
 
 
+def brownian(rng, x, t):
+    t = jnp.asarray(t, dtype=x.dtype)
+    prefix = jnp.broadcast_shapes(t.shape, x.shape[:-3])
+    noise = jax.random.normal(rng, prefix + x.shape[-3:])
+    xt = x + noise * jnp.expand_dims(t, axis=(-3, -2, -1))
+    return xt
 
-@jax.jit
-def hess_operator(Jg, Hg, gradf, Hf):
-    Ginv = jnp.linalg.inv(Jg.T.dot(Jg)) #d,d
-    JgGinv = Jg.dot(Ginv) #D,d
-    HJGinvf = jnp.dot(Hg.T, JgGinv.dot(gradf.T))  #d*d,o
-    res = Hf - jnp.reshape(HJGinvf.T, Hf.shape) #o,d,d
-    res = jnp.transpose(res, (1,2,0)) #d,d,o
-    result = vmap(jnp.dot)(JgGinv, JgGinv.dot(res)) #D,o
-    return result
-
-KEY = random.PRNGKey(14)
-@jax.jit
-def grad_hess(vae, heatkernel, z):
-    def zmaptoy(z):
-        x = vae.apply_fn({'params':vae.params}, z, KEY, mode='decode')
-        y = heatkernel.apply_fn({'params':heatkernel.params}, x)
-        return y
-    gradf = jnp.squeeze(jacfwd(zmaptoy)(z)) #o,d
-    Hf = jnp.squeeze(hessian(zmaptoy)(z)) #o,d,d
-    return gradf, Hf
-
-@jax.jit
-def grad_hess_synthetic(decoder, heatkernel, z):
-    def zmaptoy(z):
-        x = decoder(z)
-        y = heatkernel.apply_fn({'params':heatkernel.params}, x)
-        return y
-    gradf = jnp.squeeze(jacfwd(zmaptoy)(z)) #o,d
-    Hf = jnp.squeeze(hessian(zmaptoy)(z)) #o,d,d
-    return gradf, Hf
-
-@partial(jax.jit, static_argnums=(1,2,3))
-def restore_heatkernel_firststep(state, step, ckptdir, learner='adamw'):
-    if learner == 'sgd':
-        learning_rate_fn = optax.cosine_decay_schedule(
-                            init_value = 0.0001,
-                            decay_steps= 20 * 60000//32)
-        tx = optax.sgd(
-            learning_rate=learning_rate_fn,
-            momentum=0.9,
-            nesterov=True,
-        )
-        state = TrainState.create(apply_fn=state.apply_fn,params=state.params,tx=tx)
-
-    return checkpoints.restore_checkpoint(ckpt_dir=ckptdir,
-                                          target=state, step=step)
-
-@partial(jax.jit, static_argnums=(1,2))
-def restore_heatkernel(state, step, ckptdir):
-    return checkpoints.restore_checkpoint(ckpt_dir=ckptdir,
-                                          target=state, step=step)
-
-@jax.jit
-def vae_predict(state, x, rng):
-    recon_x, mean_z, _ = state.apply_fn({'params':state.params}, x, rng, training=False)
-    return recon_x, mean_z
-
-@jax.jit
-def kernel_predict(state, x):
-    return state.apply_fn({'params': state.params}, x)
-
-def laplacian_postprocess(results, config, compare):
-    t = results.shape[0]
-    W, C = config.image_size, config.channels
-
-    decomps = []
-    for r in compare:
-        decomp_r = results[..., r].reshape(t,W,W,C).reshape(-1,W,C)
-        decomps.append(to_heatmap(decomp_r, percentile=100).reshape(t,W,W,3))
-    decomps = np.stack(decomps) 
-
-    return decomps #r, t, w, w, 3
-
-
-def laplacian_decompose(test_batch, test_label, config, workdir):
-    savedir = Path(workdir) / 'results5'
-    savedir.mkdir(parents=True, exist_ok=True)
-
-    ckptdir = Path(workdir)  / 'heatkernel2'
-    vaedir = Path(workdir) / 'vae'
+def solve_heat_euclidean(config: mlc.ConfigDict, workdir: str):
     predictordir = Path(workdir) / 'predictor'
-    latest = int((checkpoints.latest_checkpoint(ckpt_dir=ckptdir)).split('_')[-1])
-    logging.info(f"Latest heat step: {latest}")
+    ckptdir = Path(workdir)  / 'heatkernel'
+    imagedir = Path(workdir)  / 'heatkernel' / 'images'
+    ckptdir.mkdir(parents=True, exist_ok=True)
+    imagedir.mkdir(parents=True, exist_ok=True)
 
     key = random.PRNGKey(14)
 
-    if config.tag == 'synthetic':
-        s = SyntheticDataset(config.image_size, 6, 60000, config.datadir, '/train', generate=False)
-        decoder = s.decode_jax
-    else:
-        vae = vae_restore(config, vaedir)
-        logging.info(f"Restored vae and heatkernel")
-        @jax.jit
-        def decoder(z): return vae.apply_fn({'params':vae.params}, z, key, mode='decode')
+    trainset, testset = get_dataset(config)
+    trainloader = torch.utils.data.DataLoader(trainset, batch_size=config.metric_batch, shuffle=True, num_workers=8, drop_last=True)
+
+    b, N = config.metric_batch, config.N_train
+    times = config.numsteps // config.stride
+
+    predictor = predict_restore(config, predictordir)
     heatkernel = predict_restore(config, predictordir)
-    
-    manifold = immersion(decoder)
 
-    delta = config.stepsize * config.stride
-    D, d, o = config.image_size ** 2 * config.channels, config.vae_d, config.num_classes
+    for step in range(1, times+1):
+        base_learning_rate = config.learning_rate * config.batch_size / 256.
+        steps_per_epoch = N // b
+        learning_rate_fn = warmup_cos_decay_lr_schedule_fn(base_learning_rate, 
+                                                       config.heat_epochs, 1, 
+                                                       steps_per_epoch)
+        tx = optax.adamw(learning_rate=learning_rate_fn, weight_decay=config.weight_decay)
+        heatkernel = TrainState.create(apply_fn=heatkernel.apply_fn, 
+                                       params=heatkernel.params, tx=tx)
 
-    decomp_all = []
-    for j in range(test_batch.shape[0]):
-        results, result = jnp.empty((0, D, o)), jnp.zeros((D, o), dtype=np.float32)
-        prediction = []
+        for epoch in range(config.heat_epochs):
+            for i, (x_start,_) in enumerate(trainloader):
+                key, subkey = random.split(key)
+                x_start = (x_start.detach().numpy()).astype(jnp.float32)
+                x_start = config.transform(x_start)
+                
+                t = np.ones(size=(b,)) * config.stepsize * step
+                x_step = brownian(subkey, x_start, t)
+                heatkernel, loss, label, output = train_step(heatkernel, predictor, x_start, x_step)
 
-        x = test_batch[j:j+1]
-        if config.tag == 'synthetic':
-            z = s.encode_jax(x)
-        else:
-            recon_x, z = vae_predict(vae, x, key)
-        Jg, Hg = manifold.jac_hess(z)
-        for step in range(latest + 1):
-            if step == 1:
-                heatkernel = restore_heatkernel_firststep(heatkernel, step, ckptdir, learner=config.heat_learner)
-            elif step > 0: heatkernel = restore_heatkernel(heatkernel, step, ckptdir)
-            if config.tag == 'synthetic':
-                gradf, Hf = grad_hess_synthetic(decoder, heatkernel, z)
-            else:
-                gradf, Hf = grad_hess(vae, heatkernel, z)
-            gradf, Hf = gradf.reshape(o,d), Hf.reshape(o,d,d)
-            contrib = hess_operator(Jg, Hg, gradf, Hf)
-            result += delta * contrib.reshape(D,o)
-            if step % config.decomp_stride == 0:
-                if step > 0:
-                    results = jnp.concatenate([results, result[jnp.newaxis,:]])
-                if step == 0:
-                    print(test_label[j], kernel_predict(heatkernel, x))
-                prediction.append(kernel_predict(heatkernel, x))
-                if not config.decomp_accum:
-                    result = jnp.zeros((D, o),dtype=np.float32)
-        
-        logging.info(f"Decomposing finished for sample {j}")
-        np.save(savedir / f'decomp_{j}.npy', results)
-        np.save(savedir / f'pred_{j}.npy', np.array(prediction))
+                if i % config.log_every_steps == 0:
+                    logging.info('Train Epoch: {} [\t{}/{} ({:.0f}%)] \tMSE: {:.9f}'.format(
+                                epoch, i * b, N,
+                                100. * i * b / N, loss))
 
-        compare = config.compare[test_label[j]] if config.compare is not None else np.arange(o)
-        decomp = laplacian_postprocess(results, config, compare)
-        decomp_all.append(decomp)
-
-    return np.stack(decomp_all) # Batch, Outputs, Time, W, W, 3
-
+        checkpoints.save_checkpoint(ckptdir, 
+                                    target=heatkernel, 
+                                    step=step, 
+                                    prefix='checkpoint_', keep=times, overwrite=True)
     
 def test(config, workdir):
 
@@ -327,7 +199,7 @@ def test(config, workdir):
     test_batch = config.transform((test_batch.detach().numpy()).astype(jnp.float32))
     test_label = config.transform_target(test_label.detach().numpy())
 
-    savedir = Path(workdir) / 'results4'
+    savedir = Path(workdir) / 'results'
     
     decomp_all = laplacian_decompose(test_batch, test_label, config, workdir)
     b, r, t = decomp_all.shape[:-3]
@@ -341,35 +213,6 @@ def test(config, workdir):
 
         save_image(save.reshape(-1, config.image_size, config.image_size, 3), 
                    savedir / f'heat_decomp_visualize_{j}_label_{test_label[j]}.png', nrow = t+1)
-
-
-def test_compare(config, workdir):
-
-    _, testset = get_dataset(config)
-    testloader = torch.utils.data.DataLoader(testset, batch_size=config.test_batch, shuffle=True, num_workers=8, drop_last=True)
-    test_batch, test_label = next(iter(testloader))
-    test_batch = config.transform((test_batch.detach().numpy()).astype(jnp.float32))
-    test_label = config.transform_target(test_label.detach().numpy())
-
-    predictor = predict_restore(config, Path(workdir) / 'predictor')
-    savedir = Path(workdir) / 'results5'
-    
-    decomp_all = laplacian_decompose(test_batch, test_label, config, workdir)
-    logging.info("Vanilla and smooth gradient at different scales")
-    grad_sg = vanilla_smooth_gradient(predictor, test_batch, test_label, config)
-    logging.info("Integrated gradient and different scales of blur")
-    ig_blur = integrated_gradient_blur(predictor, test_batch, test_label, config)
-    print(decomp_all.shape, grad_sg.shape, ig_blur.shape)
-
-    for j in range(decomp_all.shape[0]):
-        which = 0 if config.compare is not None else test_label[j] if config.classification else 0
-        original, laplace, sg, blur = test_batch[j], decomp_all[j,which,:grad_sg.shape[1]-1,...], grad_sg[j], ig_blur[j]
-        if config.channels == 1: original = jnp.tile(original, (1,1,3))
-        laplace = jnp.concatenate([original[jnp.newaxis,...], laplace])
-
-        save = jnp.concatenate([laplace, sg, blur], axis=1)
-        save_image(save, 
-                   savedir / f'heat_sg_blur_compare_{j}.png', nrow = decomp_all.shape[2]+1)
 
         
 def main(argv):

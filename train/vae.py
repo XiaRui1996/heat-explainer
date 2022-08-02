@@ -21,7 +21,7 @@ from heat_explainer.datautils.dataloader import get_dataset
 from heat_explainer.trainutils.utils import save_image
 
 
-MODEL = {'synthetic': partial(VAEflax, H=32, inner=4, layer_count=5, channels=3, first=True),
+MODEL = {'synthetic': partial(VAEflax, H=32, inner=4, layer_count=5, channels=1, first=True),
          'mnist': partial(VAElinear, H=128, act=nn.softplus)}
 
 
@@ -160,7 +160,7 @@ def train_VAE_flax(config: mlc.ConfigDict,
         x_batch = device_put((x_batch.detach().numpy()).astype(jnp.float32))
         x_batch = config.transform(x_batch)
 
-        z_batch, _  = encoder(state, x_batch, key)
+        z_batch  = encoder(state, x_batch, key)
         if i==0:
             rec_batch, _, _ = state.apply_fn({'params':state.params}, x_batch, key, training=False)
             batch_save = jnp.stack([x_batch, rec_batch], axis=1).reshape(-1, *x_batch.shape[1:])
@@ -181,7 +181,7 @@ def main(argv):
   logging.info('JAX process: %d / %d', jax.process_index(), jax.process_count())
   logging.info('JAX local devices: %r', jax.local_devices())
 
-  state, encode_z = train_VAE_flax(FLAGS.config, FLAGS.workdir)
+  train_VAE_flax(FLAGS.config, FLAGS.workdir)
 
 
 if __name__ == '__main__':
